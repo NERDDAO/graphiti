@@ -73,32 +73,38 @@ async def _build_group_projection(
     Returns a mapping from each node's uuid to its list of in-group neighbors
     with edge counts. Used by label propagation and by in-community degree
     computations for sampling.
-    """
-    projection: dict[str, list[Neighbor]] = {}
-    nodes = await EntityNode.get_by_group_ids(driver, [group_id])
-    for node in nodes:
-        match_query = """
-            MATCH (n:Entity {group_id: $group_id, uuid: $uuid})-[e:RELATES_TO]-(m: Entity {group_id: $group_id})
-        """
-        if driver.provider == GraphProvider.KUZU:
-            match_query = """
-            MATCH (n:Entity {group_id: $group_id, uuid: $uuid})-[:RELATES_TO]-(e:RelatesToNode_)-[:RELATES_TO]-(m: Entity {group_id: $group_id})
-            """
-        records, _, _ = await driver.execute_query(
-            match_query
-            + """
-            WITH count(e) AS count, m.uuid AS uuid
-            RETURN
-                uuid,
-                count
-            """,
-            uuid=node.uuid,
-            group_id=group_id,
-        )
 
-        projection[node.uuid] = [
-            Neighbor(node_uuid=record['uuid'], edge_count=record['count']) for record in records
-        ]
+    Implementation note: fetches the whole (src, tgt, edge_count) triple set
+    in a SINGLE Cypher round-trip, then seeds the projection dict from the
+    entity list so isolated nodes (no RELATES_TO edges) still appear as empty
+    lists. Previous implementation issued one query per node which was
+    O(entities) round-trips — painfully slow over public-network Aura on
+    large bonfires (e.g. 19k+ entities × ~30ms round-trip ≈ 10 minutes just
+    for projection).
+    """
+    nodes = await EntityNode.get_by_group_ids(driver, [group_id])
+    projection: dict[str, list[Neighbor]] = {n.uuid: [] for n in nodes}
+
+    if driver.provider == GraphProvider.KUZU:
+        match_query = """
+        MATCH (n:Entity {group_id: $group_id})-[:RELATES_TO]-(e:RelatesToNode_)-[:RELATES_TO]-(m:Entity {group_id: $group_id})
+        WITH n.uuid AS src, m.uuid AS tgt, count(e) AS edge_count
+        RETURN src, tgt, edge_count
+        """
+    else:
+        match_query = """
+        MATCH (n:Entity {group_id: $group_id})-[e:RELATES_TO]-(m:Entity {group_id: $group_id})
+        WITH n.uuid AS src, m.uuid AS tgt, count(e) AS edge_count
+        RETURN src, tgt, edge_count
+        """
+
+    records, _, _ = await driver.execute_query(match_query, group_id=group_id)
+    for record in records:
+        src = record['src']
+        if src in projection:
+            projection[src].append(
+                Neighbor(node_uuid=record['tgt'], edge_count=record['edge_count'])
+            )
     return projection
 
 
