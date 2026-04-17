@@ -17,7 +17,12 @@ dependencies = [
     "tenacity>=9.0.0",
     "numpy>=1.0.0",
     "python-dotenv>=1.0.1",
-    "posthog>=3.0.0"
+    "posthog>=3.0.0",
+    # NERDDAO fork: Leiden community detection replaces the LPA mega-dump
+    # failure mode (Leiden modularity 0.64 vs LPA 0.42 on a 19k-node bonfire).
+    # Driver auto-falls-back to LPA if these become unavailable at runtime.
+    "leidenalg>=0.10.0",
+    "python-igraph>=0.11.0",
 ]
 
 [project.urls]

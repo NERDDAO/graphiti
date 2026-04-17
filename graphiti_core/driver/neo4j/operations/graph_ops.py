@@ -15,11 +15,16 @@ limitations under the License.
 """
 
 import logging
+import os
 from typing import Any
 
 from graphiti_core.driver.driver import GraphProvider
 from graphiti_core.driver.operations.graph_ops import GraphMaintenanceOperations
-from graphiti_core.driver.operations.graph_utils import Neighbor, label_propagation
+from graphiti_core.driver.operations.graph_utils import (
+    Neighbor,
+    label_propagation,
+    leiden_cluster,
+)
 from graphiti_core.driver.query_executor import QueryExecutor
 from graphiti_core.driver.record_parsers import community_node_from_record, entity_node_from_record
 from graphiti_core.graph_queries import get_fulltext_indices, get_range_indices
@@ -31,6 +36,13 @@ from graphiti_core.models.nodes.node_db_queries import (
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 
 logger = logging.getLogger(__name__)
+
+# Algorithm selection + tuning via env. Default: Leiden via leidenalg.
+# Set GRAPHITI_COMMUNITY_ALGO=lpa to force the legacy label-propagation path.
+_COMMUNITY_ALGO = os.getenv('GRAPHITI_COMMUNITY_ALGO', 'leiden').lower()
+_LEIDEN_MIN_SIZE = int(os.getenv('GRAPHITI_LEIDEN_MIN_COMMUNITY_SIZE', '5'))
+_LEIDEN_RESOLUTION = float(os.getenv('GRAPHITI_LEIDEN_RESOLUTION', '1.0'))
+_LEIDEN_SEED = int(os.getenv('GRAPHITI_LEIDEN_SEED', '42'))
 
 
 class Neo4jGraphMaintenanceOperations(GraphMaintenanceOperations):
@@ -92,40 +104,38 @@ class Neo4jGraphMaintenanceOperations(GraphMaintenanceOperations):
 
         resolved_group_ids: list[str] = group_ids or []
         for group_id in resolved_group_ids:
-            projection: dict[str, list[Neighbor]] = {}
-
-            # Get all entity nodes for this group
-            node_records, _, _ = await executor.execute_query(
+            # Single-query batch projection: fetch every (src_uuid, tgt_uuid,
+            # edge_count) triple in one round trip. The prior N+1 implementation
+            # issued one Cypher per entity — ~19k RTTs for a medium bonfire.
+            edge_records, _, _ = await executor.execute_query(
                 """
-                MATCH (n:Entity)
-                WHERE n.group_id IN $group_ids
-                RETURN
-                """
-                + get_entity_node_return_query(GraphProvider.NEO4J),
-                group_ids=[group_id],
+                MATCH (n:Entity {group_id: $group_id})-[e:RELATES_TO]-(m:Entity {group_id: $group_id})
+                RETURN n.uuid AS src, m.uuid AS tgt, count(e) AS edge_count
+                """,
+                group_id=group_id,
                 routing_='r',
             )
-            nodes = [entity_node_from_record(r) for r in node_records]
 
-            for node in nodes:
-                records, _, _ = await executor.execute_query(
-                    """
-                    MATCH (n:Entity {group_id: $group_id, uuid: $uuid})-[e:RELATES_TO]-(m: Entity {group_id: $group_id})
-                    WITH count(e) AS count, m.uuid AS uuid
-                    RETURN
-                        uuid,
-                        count
-                    """,
-                    uuid=node.uuid,
-                    group_id=group_id,
-                )
+            # Seed projection with every entity so isolated nodes appear too
+            # (matters for the caller, which needs to see zero-neighbor nodes
+            # even though Leiden/LPA will drop them).
+            entity_records, _, _ = await executor.execute_query(
+                """
+                MATCH (n:Entity {group_id: $group_id})
+                RETURN n.uuid AS uuid
+                """,
+                group_id=group_id,
+                routing_='r',
+            )
+            projection: dict[str, list[Neighbor]] = {
+                r['uuid']: [] for r in entity_records
+            }
+            for rec in edge_records:
+                src, tgt, count = rec['src'], rec['tgt'], rec['edge_count']
+                if src in projection:
+                    projection[src].append(Neighbor(node_uuid=tgt, edge_count=count))
 
-                projection[node.uuid] = [
-                    Neighbor(node_uuid=record['uuid'], edge_count=record['count'])
-                    for record in records
-                ]
-
-            cluster_uuids = label_propagation(projection)
+            cluster_uuids = self._cluster(projection)
 
             # Fetch full node objects for each cluster
             for cluster in cluster_uuids:
@@ -144,6 +154,33 @@ class Neo4jGraphMaintenanceOperations(GraphMaintenanceOperations):
                 community_clusters.append([entity_node_from_record(r) for r in cluster_records])
 
         return community_clusters
+
+    @staticmethod
+    def _cluster(projection: dict[str, list[Neighbor]]) -> list[list[str]]:
+        """Run the configured community algorithm, fall back to LPA on error.
+
+        Default is Leiden (``GRAPHITI_COMMUNITY_ALGO=leiden``); set the env to
+        ``lpa`` to force label-propagation (or when leidenalg / igraph are not
+        installed, which raises ImportError and auto-falls-back with a warning).
+        """
+        if _COMMUNITY_ALGO == 'lpa':
+            return label_propagation(projection)
+        try:
+            return leiden_cluster(
+                projection,
+                min_community_size=_LEIDEN_MIN_SIZE,
+                resolution=_LEIDEN_RESOLUTION,
+                seed=_LEIDEN_SEED,
+            )
+        except ImportError as e:
+            logger.warning(
+                'Leiden requested but leidenalg/igraph unavailable (%s); '
+                'falling back to label-propagation. Install with `pip install '
+                'leidenalg python-igraph` or set GRAPHITI_COMMUNITY_ALGO=lpa '
+                'to silence this warning.',
+                e,
+            )
+            return label_propagation(projection)
 
     async def remove_communities(
         self,
