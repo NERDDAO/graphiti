@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import os
 from collections import defaultdict
 
 from pydantic import BaseModel
 
 from graphiti_core.driver.driver import GraphDriver, GraphProvider
+from graphiti_core.driver.operations.graph_utils import leiden_cluster
 from graphiti_core.edges import CommunityEdge
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.helpers import semaphore_gather
@@ -19,7 +21,43 @@ from graphiti_core.utils.text_utils import MAX_SUMMARY_CHARS, truncate_at_senten
 
 MAX_COMMUNITY_BUILD_CONCURRENCY = 10
 
+# Community algorithm selection — default to Leiden (higher modularity,
+# no LPA mega-dump). Set GRAPHITI_COMMUNITY_ALGO=lpa to force legacy path.
+_COMMUNITY_ALGO = os.getenv('GRAPHITI_COMMUNITY_ALGO', 'leiden').lower()
+_LEIDEN_MIN_SIZE = int(os.getenv('GRAPHITI_LEIDEN_MIN_COMMUNITY_SIZE', '5'))
+_LEIDEN_RESOLUTION = float(os.getenv('GRAPHITI_LEIDEN_RESOLUTION', '1.0'))
+_LEIDEN_SEED = int(os.getenv('GRAPHITI_LEIDEN_SEED', '42'))
+
 logger = logging.getLogger(__name__)
+
+
+def _cluster_with_configured_algorithm(
+    projection: dict[str, list['Neighbor']],
+) -> list[list[str]]:
+    """Run the configured community-detection algorithm.
+
+    Default: Leiden (``leidenalg`` + ``python-igraph``). Falls back to LPA on
+    ImportError — keeps deployments with minimal Docker images working if
+    those libs get stripped.
+    """
+    if _COMMUNITY_ALGO == 'lpa':
+        return label_propagation(projection)
+    try:
+        # leiden_cluster in graph_utils takes the same Neighbor shape used
+        # elsewhere in this module; both are structurally compatible.
+        return leiden_cluster(
+            projection,  # type: ignore[arg-type]
+            min_community_size=_LEIDEN_MIN_SIZE,
+            resolution=_LEIDEN_RESOLUTION,
+            seed=_LEIDEN_SEED,
+        )
+    except ImportError as e:
+        logger.warning(
+            'Leiden requested but leidenalg/igraph unavailable (%s); '
+            'falling back to label-propagation.',
+            e,
+        )
+        return label_propagation(projection)
 
 
 class Neighbor(BaseModel):
@@ -114,7 +152,7 @@ async def get_community_clusters(
         if return_projection:
             combined_projection.update(projection)
 
-        cluster_uuids = label_propagation(projection)
+        cluster_uuids = _cluster_with_configured_algorithm(projection)
 
         community_clusters.extend(
             list(
